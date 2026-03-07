@@ -1,0 +1,23 @@
+# PHP dependencies
+/vendor/
+composer.lock
+
+# IDEs and editors
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Environment and logs
+.env
+.env.local
+*.log
+
+# Model and Tokenizer binaries
+*.bin
+stories15M.bin
+tokenizer.bin
