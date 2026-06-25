@@ -66,8 +66,8 @@ class TransformerWeights
         $this->w3 = $this->readFloats($fileHandle, $config->nLayers * $config->dim * $config->hiddenDim);
         $this->rmsFinalWeight = $this->readFloats($fileHandle, $config->dim);
 
-        // Skip freq_cis_real and freq_cis_imag (computed on the fly)
-        fseek($fileHandle, $config->seqLen * $headSize, SEEK_CUR);
+        // Skip freq_cis_real and freq_cis_imag — each array is seqLen*(headSize/2) floats, 4 bytes each
+        fseek($fileHandle, $config->seqLen * $headSize * 4, SEEK_CUR);
 
         if (!$sharedWeights) {
             $this->wcls = $this->readFloats($fileHandle, $config->vocabSize * $config->dim);
@@ -79,14 +79,14 @@ class TransformerWeights
     private function readFloats($fileHandle, int $count): SplFixedArray
     {
         $floatsArray = new SplFixedArray($count);
-        // Reading in chunks to avoid memory spikes and for speed
-        $chunkSize = 10000;
+        // 65536 floats per chunk (~256 KB) — fewer fread/unpack calls than 10k
+        $chunkSize = 65536;
         for ($offset = 0; $offset < $count; $offset += $chunkSize) {
             $currentChunkSize = min($chunkSize, $count - $offset);
             $binaryData = fread($fileHandle, $currentChunkSize * 4);
-            $unpackedFloats = unpack("f*", $binaryData);
+            $unpackedFloats = array_values(unpack("f*", $binaryData));
             for ($index = 0; $index < $currentChunkSize; $index++) {
-                $floatsArray[$offset + $index] = $unpackedFloats[$index + 1];
+                $floatsArray[$offset + $index] = $unpackedFloats[$index];
             }
         }
         return $floatsArray;
@@ -110,18 +110,19 @@ class RunState
 
     public function __construct(Config $config)
     {
+        $kvDim = (int)($config->dim * $config->nKvHeads / $config->nHeads);
         $this->x = new SplFixedArray($config->dim);
         $this->xb = new SplFixedArray($config->dim);
         $this->xb2 = new SplFixedArray($config->dim);
         $this->hb = new SplFixedArray($config->hiddenDim);
         $this->hb2 = new SplFixedArray($config->hiddenDim);
         $this->q = new SplFixedArray($config->dim);
-        $this->k = new SplFixedArray($config->dim);
-        $this->v = new SplFixedArray($config->dim);
+        $this->k = new SplFixedArray($kvDim);
+        $this->v = new SplFixedArray($kvDim);
         $this->att = new SplFixedArray($config->nHeads * $config->seqLen);
         $this->logits = new SplFixedArray($config->vocabSize);
-        $this->keyCache = new SplFixedArray($config->nLayers * $config->seqLen * $config->dim);
-        $this->valueCache = new SplFixedArray($config->nLayers * $config->seqLen * $config->dim);
+        $this->keyCache = new SplFixedArray($config->nLayers * $config->seqLen * $kvDim);
+        $this->valueCache = new SplFixedArray($config->nLayers * $config->seqLen * $kvDim);
     }
 }
 
@@ -173,16 +174,21 @@ function transformer(int $token, int $pos, Config $config, RunState $state, Tran
 {
     $dim = $config->dim;
     $hiddenDim = $config->hiddenDim;
-    $headSize = (int)($dim / $config->nHeads);
-    $kvDim = (int)($config->dim * $config->nKvHeads / $config->nHeads);
-    $kvMul = (int)($config->nHeads / $config->nKvHeads);
+    $nHeads = $config->nHeads;
+    $nKvHeads = $config->nKvHeads;
+    $nLayers = $config->nLayers;
+    $seqLen = $config->seqLen;
+    $vocabSize = $config->vocabSize;
+    $headSize = (int)($dim / $nHeads);
+    $kvDim = (int)($dim * $nKvHeads / $nHeads);
+    $kvMul = (int)($nHeads / $nKvHeads);
 
     // Embedding lookup
     for ($i = 0; $i < $dim; $i++) {
         $state->x[$i] = $weights->tokenEmbeddingTable[$token * $dim + $i];
     }
 
-    for ($layer = 0; $layer < $config->nLayers; $layer++) {
+    for ($layer = 0; $layer < $nLayers; $layer++) {
         // Attention RMSNorm
         rmsNorm($state->xb, $state->x, $weights->rmsAttWeight, $dim, $layer * $dim);
 
@@ -209,19 +215,21 @@ function transformer(int $token, int $pos, Config $config, RunState $state, Tran
         }
 
         // KV cache
-        $layerOffset = $layer * $config->seqLen * $kvDim;
+        $layerOffset = $layer * $seqLen * $kvDim;
+        $posKvOffset = $pos * $kvDim;
         for ($i = 0; $i < $kvDim; $i++) {
-            $state->keyCache[$layerOffset + $pos * $kvDim + $i] = $state->k[$i];
-            $state->valueCache[$layerOffset + $pos * $kvDim + $i] = $state->v[$i];
+            $state->keyCache[$layerOffset + $posKvOffset + $i] = $state->k[$i];
+            $state->valueCache[$layerOffset + $posKvOffset + $i] = $state->v[$i];
         }
 
         // Multihead attention
-        for ($head = 0; $head < $config->nHeads; $head++) {
+        for ($head = 0; $head < $nHeads; $head++) {
             $qOffset = $head * $headSize;
-            $attOffset = $head * $config->seqLen;
+            $attOffset = $head * $seqLen;
+            $kvHeadOffset = (int)($head / $kvMul) * $headSize;
 
             for ($t = 0; $t <= $pos; $t++) {
-                $kOffset = $layerOffset + $t * $kvDim + (int)($head / $kvMul) * $headSize;
+                $kOffset = $layerOffset + $t * $kvDim + $kvHeadOffset;
                 $score = 0.0;
                 for ($i = 0; $i < $headSize; $i++) {
                     $score += $state->q[$qOffset + $i] * $state->keyCache[$kOffset + $i];
@@ -238,7 +246,7 @@ function transformer(int $token, int $pos, Config $config, RunState $state, Tran
             }
 
             for ($t = 0; $t <= $pos; $t++) {
-                $vOffset = $layerOffset + $t * $kvDim + (int)($head / $kvMul) * $headSize;
+                $vOffset = $layerOffset + $t * $kvDim + $kvHeadOffset;
                 $a = $state->att[$attOffset + $t];
                 for ($i = 0; $i < $headSize; $i++) {
                     $state->xb[$xbOffset + $i] += $a * $state->valueCache[$vOffset + $i];
@@ -282,7 +290,7 @@ function transformer(int $token, int $pos, Config $config, RunState $state, Tran
     rmsNorm($state->x, $state->x, $weights->rmsFinalWeight, $dim);
 
     // Classifier
-    matMul($state->logits, $state->x, $weights->wcls, $dim, $config->vocabSize);
+    matMul($state->logits, $state->x, $weights->wcls, $dim, $vocabSize);
 
     return $state->logits;
 }
@@ -290,6 +298,7 @@ function transformer(int $token, int $pos, Config $config, RunState $state, Tran
 class Tokenizer
 {
     public array $vocab;
+    public array $vocabLookup; // string → token id for O(1) lookup in encode()
     public SplFixedArray $vocabScores;
     public int $vocabSize;
     public int $maxTokenLength;
@@ -307,6 +316,7 @@ class Tokenizer
             $this->vocab[$i] = fread($fileHandle, $len);
         }
         fclose($fileHandle);
+        $this->vocabLookup = array_flip($this->vocab);
     }
 
     public function decode(int $prevToken, int $token): string
@@ -336,16 +346,18 @@ class Tokenizer
         }
 
         $i = 0;
-        while ($i < strlen($str)) {
-            $bestLen = -1;
+        $strLen = strlen($str);
+        while ($i < $strLen) {
             $bestToken = -1;
-
-            for ($t = 0; $t < $this->vocabSize; $t++) {
-                $v = $this->vocab[$t];
-                $len = strlen($v);
-                if ($len > $bestLen && substr($str, $i, $len) === $v) {
+            $bestLen = 0;
+            $maxLen = min($this->maxTokenLength, $strLen - $i);
+            // Try longest match first — O(maxTokenLen) instead of O(vocabSize)
+            for ($len = $maxLen; $len >= 1; $len--) {
+                $substr = substr($str, $i, $len);
+                if (isset($this->vocabLookup[$substr])) {
+                    $bestToken = $this->vocabLookup[$substr];
                     $bestLen = $len;
-                    $bestToken = $t;
+                    break;
                 }
             }
 
@@ -353,7 +365,7 @@ class Tokenizer
                 $tokens[] = $bestToken;
                 $i += $bestLen;
             } else {
-                // Just skip unknown byte
+                // Skip unknown byte
                 $i++;
             }
         }
@@ -418,11 +430,12 @@ fclose($checkpointFile);
 $endLoading = hrtime(true);
 
 $state = new RunState($config);
-if (!file_exists("tokenizer.bin")) {
-    echo "Error: tokenizer.bin not found\n";
+$tokenizerPath = __DIR__ . DIRECTORY_SEPARATOR . "tokenizer.bin";
+if (!file_exists($tokenizerPath)) {
+    echo "Error: tokenizer.bin not found in " . __DIR__ . "\n";
     exit(1);
 }
-$tokenizer = new Tokenizer("tokenizer.bin", $config->vocabSize);
+$tokenizer = new Tokenizer($tokenizerPath, $config->vocabSize);
 
 $promptTokens = $prompt !== "" ? $tokenizer->encode($prompt, true, false) : [1];
 $numPromptTokens = count($promptTokens);
@@ -439,7 +452,12 @@ while ($pos < $steps) {
     if ($pos < $numPromptTokens - 1) {
         $next = $promptTokens[$pos + 1];
     } else {
+        // Start timing generation after prompt prefill is done
+        if ($tokensGenerated === 0) {
+            $startGen = hrtime(true);
+        }
         $next = sample($logits, $config->vocabSize, $temperature);
+        $tokensGenerated++;
     }
 
     $piece = $tokenizer->decode($token, $next);
@@ -448,7 +466,6 @@ while ($pos < $steps) {
 
     $token = $next;
     $pos++;
-    $tokensGenerated++;
 
     if ($token == 2) {
         break;
